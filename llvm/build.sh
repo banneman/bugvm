@@ -1,5 +1,3 @@
-#!/bin/bash
-
 SELF=$(basename $0)
 BASE=$(cd $(dirname $0); pwd -P)
 CLEAN=0
@@ -45,10 +43,12 @@ Darwin)
   TARGETS="macosx-x86_64"
   ;;
 Linux)
-  TARGETS="linux-x86_64" # linux-x86
+  TARGETS="linux-x86_64"
+  #TARGETS="linux-x86_64 linux-x86"
   ;;
 Windows)
-  TARGETS="windows-x86_64" # windows-x86"
+  TARGETS="windows-x86_64"
+  #TARGETS="windows-x86_64 windows-x86"
   ;;
 *)
   echo "Unsupported OS: $OS"
@@ -65,6 +65,11 @@ fi
 
 case $OS in
 Darwin)
+  if xcrun --sdk macosx --show-sdk-version &> /dev/null; then
+    MACOSX_SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+  else
+    MACOSX_SDK_VERSION=10.7
+  fi
   if xcrun -f clang &> /dev/null; then
     CC=$(xcrun -f clang)
   else
@@ -81,7 +86,9 @@ Linux)
   CXX=$(which g++)
   ;;
 Windows)
+  #CC=$(which i686-w64-mingw32-gcc)
   CC=$(which x86_64-w64-mingw32-gcc)
+  #CXX=$(which i686-w64-mingw32-g++)
   CXX=$(which x86_64-w64-mingw32-g++)
   WORKERS=1
   ;;
@@ -97,7 +104,7 @@ for T in $TARGETS; do
   BUILD_TYPE=Release
   mkdir -p "$BASE/target.llvm/build/$T"
   rm -rf "$BASE/binaries/$OS/$ARCH"
-  bash -c "cd '$BASE/target.llvm/build/$T'; cmake -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DOS=$OS -DARCH=$ARCH '$BASE'; make -j $WORKERS install/strip"
+  bash -c "cd '$BASE/target.llvm/build/$T'; cmake -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DMACOSX_SDK_VERSION=$MACOSX_SDK_VERSION -DOS=$OS -DARCH=$ARCH '$BASE'; make -j $WORKERS install/strip"
   R=$?
   if [[ $R != 0 ]]; then
     echo "$T build failed"

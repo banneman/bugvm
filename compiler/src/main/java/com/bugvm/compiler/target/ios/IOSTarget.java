@@ -16,9 +16,11 @@
  */
 package com.bugvm.compiler.target.ios;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileFilter;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -55,11 +57,6 @@ import com.bugvm.compiler.target.ios.ProvisioningProfile.Type;
 import com.bugvm.compiler.util.Executor;
 import com.bugvm.compiler.util.ToolchainUtil;
 import com.bugvm.compiler.util.io.OpenOnWriteFileOutputStream;
-import com.bugvm.libimobiledevice.AfcClient.UploadProgressCallback;
-import com.bugvm.libimobiledevice.IDevice;
-import com.bugvm.libimobiledevice.InstallationProxyClient.StatusCallback;
-import com.bugvm.libimobiledevice.util.AppLauncher;
-import com.bugvm.libimobiledevice.util.AppLauncherCallback;
 
 import com.dd.plist.NSArray;
 import com.dd.plist.NSDictionary;
@@ -75,14 +72,13 @@ import com.dd.plist.PropertyListParser;
 public class IOSTarget extends AbstractTarget {
     public static final String TYPE = "ios";
 
-    private static File iosSimPath;
+    private static File iosSimPath = null;
 
     private Arch arch;
     private SDK sdk;    
     private File entitlementsPList;
     private SigningIdentity signIdentity;
     private ProvisioningProfile provisioningProfile;
-    private IDevice device;
     private File partialPListDir;
 
     public IOSTarget() {}
@@ -112,21 +108,6 @@ public class IOSTarget extends AbstractTarget {
         return arch == Arch.thumbv7 || arch == Arch.arm64;
     }
 
-    public static synchronized File getIosSimPath() {
-        if (iosSimPath == null) {
-            try {
-                File path = File.createTempFile("ios-sim", "");
-                FileUtils.copyURLToFile(IOSTarget.class.getResource("/ios-sim"), path);
-                path.setExecutable(true);
-                path.deleteOnExit();
-                iosSimPath = path;
-            } catch (IOException e) {
-                throw new Error(e);
-            }
-        }
-        return iosSimPath;
-    }
-
     public List<SDK> getSDKs() {
         if (isSimulatorArch(arch)) {
             return SDK.listSimulatorSDKs();
@@ -135,68 +116,39 @@ public class IOSTarget extends AbstractTarget {
         }
     }
 
-    /**
-     * Returns the {@link IDevice} when an app has been launched on a device.
-     * Returns {@code null} before {@link #launch(LaunchParameters)} has been
-     * called or if the app was launched in the simulator.
-     */
-    public IDevice getDevice() {
-        return device;
-    }
-
     @Override
     protected Launcher createLauncher(LaunchParameters launchParameters) throws IOException {
         if (isSimulatorArch(arch)) {
             return createIOSSimLauncher(launchParameters);
         } else {
-            return createIOSDevLauncher(launchParameters);
+            return createIOSDeviceLauncher(launchParameters);
         }
     }
 
     private Launcher createIOSSimLauncher(LaunchParameters launchParameters)
             throws IOException {
 
-        File dir = getAppDir();
+        String appDir = getAppDir().getAbsolutePath();
+        String getDeviceTypeId = "";
 
-        String iosSimPath = new File(config.getHome().getBinDir(), "ios-sim").getAbsolutePath();
-
-        List<Object> args = new ArrayList<Object>();
-        args.add("launch");
-        args.add(dir);
-        args.add("--timeout");
-        args.add("90");
-        args.add("--unbuffered");
         if (((IOSSimulatorLaunchParameters) launchParameters).getDeviceType() != null) {
             DeviceType deviceType = ((IOSSimulatorLaunchParameters) launchParameters).getDeviceType();
-            args.add("--devicetypeid");
-            args.add(deviceType.getDeviceTypeId());
-        }
-        if (launchParameters.getStdoutFifo() != null) {
-            args.add("--stdout");
-            args.add(launchParameters.getStdoutFifo());
-        }
-        if (launchParameters.getStderrFifo() != null) {
-            args.add("--stderr");
-            args.add(launchParameters.getStderrFifo());
-        }
-        if (launchParameters.getEnvironment() != null) {
-            for (Entry<String, String> entry : launchParameters.getEnvironment().entrySet()) {
-                args.add("--setenv");
-                args.add(entry.getKey() + "=" + entry.getValue());
-            }
+            getDeviceTypeId = deviceType.getDeviceTypeId();
         }
 
-        if (!launchParameters.getArguments().isEmpty()) {
-            args.add("--args");
-            args.addAll(launchParameters.getArguments());
-        }
+        new com.bugvm.compiler.Sim().launch(appDir, getDeviceTypeId);
 
-        File xcodePath = new File(ToolchainUtil.findXcodePath());
-        Map<String, String> env = Collections.singletonMap("DEVELOPER_DIR", xcodePath.getAbsolutePath());
-        
-        // See issue https://github.com/bugvm/bugvm/issues/1150, we need
-        // to swallow the error message by ios-sim on Xcode 7. We need
-        // to remove this
+        //dummy
+        return new Executor(null, new File("/bin/bash"))
+                .wd(launchParameters.getWorkingDirectory())
+                .inheritEnv(true);
+    }
+
+    private Launcher createIOSDeviceLauncher(LaunchParameters launchParameters)
+            throws IOException {
+
+        File dir = getAppDir();
+
         Logger proxyLogger = new Logger() {
             boolean skipWarningsAndErrors = false;
 
@@ -234,7 +186,7 @@ public class IOSTarget extends AbstractTarget {
             public void error(String format, Object... args) {
                 if (format.contains(
                         "Requested but did not find extension point with identifier Xcode.DVTFoundation.DevicePlatformMapping")) {
-                    skipWarningsAndErrors = true;                    
+                    skipWarningsAndErrors = true;
                 }
                 if (skipWarningsAndErrors) {
                     config.getLogger().info(format, args);
@@ -243,94 +195,21 @@ public class IOSTarget extends AbstractTarget {
                 }
             }
         };
-        
-        return new Executor(proxyLogger, iosSimPath)
-                .args(args)
-                .wd(launchParameters.getWorkingDirectory())
-                .inheritEnv(false)
-                .env(env);
-    }
-
-    private Launcher createIOSDevLauncher(LaunchParameters launchParameters)
-            throws IOException {
-
-        IOSDeviceLaunchParameters deviceLaunchParameters = (IOSDeviceLaunchParameters) launchParameters;
-        String deviceId = deviceLaunchParameters.getDeviceId();
-        int forwardPort = deviceLaunchParameters.getForwardPort();
-        AppLauncherCallback callback = deviceLaunchParameters.getAppPathCallback();
-        if (deviceId == null) {
-            String[] udids = IDevice.listUdids();
-            if (udids.length == 0) {
-                throw new RuntimeException("No devices connected");
-            }
-            if (udids.length > 1) {
-                config.getLogger().warn("More than 1 device connected (%s). "
-                        + "Using %s.", Arrays.asList(udids), udids[0]);
-            }
-            deviceId = udids[0];
-        }
-        device = new IDevice(deviceId);
-
-        OutputStream out = null;
-        if (launchParameters.getStdoutFifo() != null) {
-            out = new OpenOnWriteFileOutputStream(launchParameters.getStdoutFifo());
-        } else {
-            out = System.out;
-        }
 
         Map<String, String> env = launchParameters.getEnvironment();
         if (env == null) {
             env = new HashMap<>();
         }
 
-        AppLauncher launcher = new AppLauncher(device, getAppDir()) {
-            protected void log(String s, Object... args) {
-                config.getLogger().info(s, args);
-            }
-        }
-                .stdout(out)
-                .closeOutOnExit(true)
-                .args(launchParameters.getArguments().toArray(new String[0]))
-                .env(env)
-                .forward(forwardPort)
-                .appLauncherCallback(callback)
-                .xcodePath(ToolchainUtil.findXcodePath())
-                .uploadProgressCallback(new UploadProgressCallback() {
-                    boolean first = true;
-
-                    public void success() {
-                        config.getLogger().info("[100%%] Upload complete");
-                    }
-
-                    public void progress(File path, int percentComplete) {
-                        if (first) {
-                            config.getLogger().info("[  0%%] Beginning upload");
-                        }
-                        first = false;
-                        config.getLogger().info("[%3d%%] Uploading %s", percentComplete, path);
-                    }
-
-                    public void error(String message) {}
-                })
-                .installStatusCallback(new StatusCallback() {
-                    boolean first = true;
-
-                    public void success() {
-                        config.getLogger().info("[100%%] Install complete");
-                    }
-
-                    public void progress(String status, int percentComplete) {
-                        if (first) {
-                            config.getLogger().info("[  0%%] Beginning installation");
-                        }
-                        first = false;
-                        config.getLogger().info("[%3d%%] %s", percentComplete, status);
-                    }
-
-                    public void error(String message) {}
-                });
-
-        return new AppLauncherProcess(config.getLogger(), launcher, launchParameters);
+        File ideviceinstallerPath = new File(config.getHome().getBinDir(), "ideviceinstaller");
+        List<Object> ideviceinstallerArgs = new ArrayList<Object>();
+        ideviceinstallerArgs.add("-i");
+        ideviceinstallerArgs.add(dir);
+        return new Executor(proxyLogger, ideviceinstallerPath)
+                .args(ideviceinstallerArgs)
+                .wd(launchParameters.getWorkingDirectory())
+                .inheritEnv(false)
+                .env(env);
     }
 
     @Override
@@ -366,6 +245,7 @@ public class IOSTarget extends AbstractTarget {
                 ccArgs.add("-Wl,-no_pie");
             }
         }
+
         if (majorVersionNumber >= 7) {
             // On iOS 7 and higher the linker will default to link against
             // libc++ which is needed for C++11 support. We need the older
@@ -374,6 +254,7 @@ public class IOSTarget extends AbstractTarget {
             // to link against /usr/lib/libc++.dylib explicitly.
             ccArgs.add("-stdlib=libstdc++");
         }
+
         ccArgs.add("-isysroot");
         ccArgs.add(sdk.getRoot().getAbsolutePath());
         
@@ -871,7 +752,7 @@ public class IOSTarget extends AbstractTarget {
 
         if (dict.objectForKey("MinimumOSVersion") == null) {
             // This is required
-            dict.put("MinimumOSVersion", "6.1.6");
+            dict.put("MinimumOSVersion", "7.0");
         }
 
         customizeInfoPList(dict);
@@ -987,7 +868,7 @@ public class IOSTarget extends AbstractTarget {
 
     /**
      * Copies the dSYM and the executable to {@code ~/Library/Developer/Xcode/
-     * DerivedData/RoboVM/Build/Products/<appname>_<timestamp>/}.
+     * DerivedData/BugVM/Build/Products/<appname>_<timestamp>/}.
      */
     private void copyToIndexedDir(File dir, String executable, File dsymDir, File exePath) {
         SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmmss");
